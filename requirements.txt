@@ -3,3 +3,4 @@ requests
 firebase-admin
 flask
 beautifulsoup4
+gunicorn
