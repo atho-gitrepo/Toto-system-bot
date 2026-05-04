@@ -4,6 +4,10 @@ from typing import Dict, List, Optional
 from datetime import datetime
 import json
 import os
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class FirebaseService:
     def __init__(self, credentials_json: str = None, project_id: str = None):
@@ -12,23 +16,19 @@ class FirebaseService:
         
         try:
             if not firebase_admin._apps:
-                # Try different credential sources
                 cred = None
+                cred_dict = None
                 
                 if credentials_json:
-                    # From environment variable
                     cred_dict = json.loads(credentials_json)
                     cred = credentials.Certificate(cred_dict)
                 elif os.path.exists('firebase-credentials.json'):
-                    # From file
-                    cred = credentials.Certificate('firebase-credentials.json')
-                elif os.getenv('GOOGLE_APPLICATION_CREDENTIALS'):
-                    # From Google Cloud default credentials
-                    cred = credentials.ApplicationDefault()
+                    with open('firebase-credentials.json') as f:
+                        cred_dict = json.load(f)
+                    cred = credentials.Certificate(cred_dict)
                 else:
                     raise Exception("No Firebase credentials found")
                 
-                # Initialize Firebase with Project ID (for Firestore)
                 app_options = {}
                 if project_id:
                     app_options['projectId'] = project_id
@@ -36,21 +36,20 @@ class FirebaseService:
                     app_options['projectId'] = cred_dict['project_id']
                 
                 firebase_admin.initialize_app(cred, app_options)
-                print("Firebase initialized successfully")
+                logger.info("Firebase initialized successfully")
             
-            # Get Firestore client (no URL needed)
             self.db = firestore.client()
             self.initialized = True
-            print("Firestore client connected")
+            logger.info("Firestore client connected")
             
         except Exception as e:
-            print(f"Firebase initialization error: {e}")
+            logger.error(f"Firebase initialization error: {e}")
             self.initialized = False
     
-    def save_generation(self, numbers: List[int], metadata: Dict = None) -> str:
-        """Save generated numbers to Firestore, returns document ID"""
+    def save_generation(self, numbers: List[int], draw_info: Dict = None) -> Optional[str]:
+        """Save generated numbers with draw information"""
         if not self.initialized:
-            print("Firebase not initialized")
+            logger.error("Firebase not initialized")
             return None
         
         try:
@@ -59,17 +58,19 @@ class FirebaseService:
                 'timestamp': firestore.SERVER_TIMESTAMP,
                 'date': datetime.now().isoformat(),
                 'type': 'system8',
-                'metadata': metadata or {}
+                'draw_no': draw_info.get('draw_no') if draw_info else None,
+                'draw_date': draw_info.get('draw_date') if draw_info else None,
+                'status': 'pending',
+                'checked': False
             }
             
-            # Add document to 'generations' collection
             doc_ref = self.db.collection('generations').document()
             doc_ref.set(doc_data)
-            print(f"Generation saved with ID: {doc_ref.id}")
+            logger.info(f"Generation saved with ID: {doc_ref.id} for draw {draw_info.get('draw_no')}")
             return doc_ref.id
             
         except Exception as e:
-            print(f"Error saving generation: {e}")
+            logger.error(f"Error saving generation: {e}")
             return None
     
     def save_result(self, generation_id: str, result_data: Dict) -> bool:
@@ -79,21 +80,50 @@ class FirebaseService:
         
         try:
             result_data['checked_at'] = firestore.SERVER_TIMESTAMP
+            result_data['checked_at_iso'] = datetime.now().isoformat()
             
-            # Save to 'results' collection
+            # Save to results collection
             doc_ref = self.db.collection('results').document(generation_id)
             doc_ref.set(result_data)
             
-            # Update generation with result reference
+            # Update generation status
             generation_ref = self.db.collection('generations').document(generation_id)
-            generation_ref.update({'result_checked': True, 'result_id': generation_id})
+            generation_ref.update({
+                'checked': True,
+                'status': 'completed',
+                'result_id': generation_id,
+                'matches': result_data.get('matches', 0),
+                'prize_amount': result_data.get('prize_amount', 0)
+            })
             
-            print(f"Result saved for generation: {generation_id}")
+            logger.info(f"Result saved for generation {generation_id}")
             return True
             
         except Exception as e:
-            print(f"Error saving result: {e}")
+            logger.error(f"Error saving result: {e}")
             return False
+    
+    def get_pending_generations(self) -> List[Dict]:
+        """Get generations that haven't been checked yet"""
+        if not self.initialized:
+            return []
+        
+        try:
+            docs = self.db.collection('generations')\
+                .where('checked', '==', False)\
+                .where('status', '==', 'pending')\
+                .stream()
+            
+            pending = []
+            for doc in docs:
+                data = doc.to_dict()
+                data['id'] = doc.id
+                pending.append(data)
+            return pending
+            
+        except Exception as e:
+            logger.error(f"Error getting pending generations: {e}")
+            return []
     
     def get_last_generation(self) -> Optional[Dict]:
         """Get the most recent generation"""
@@ -113,29 +143,32 @@ class FirebaseService:
             return None
             
         except Exception as e:
-            print(f"Error getting last generation: {e}")
+            logger.error(f"Error getting last generation: {e}")
             return None
     
-    def get_generation_by_id(self, doc_id: str) -> Optional[Dict]:
-        """Get specific generation by ID"""
+    def get_generation_by_draw(self, draw_no: str) -> Optional[Dict]:
+        """Get generation for specific draw number"""
         if not self.initialized:
             return None
         
         try:
-            doc_ref = self.db.collection('generations').document(doc_id)
-            doc = doc_ref.get()
-            if doc.exists:
+            docs = self.db.collection('generations')\
+                .where('draw_no', '==', draw_no)\
+                .limit(1)\
+                .stream()
+            
+            for doc in docs:
                 data = doc.to_dict()
                 data['id'] = doc.id
                 return data
             return None
             
         except Exception as e:
-            print(f"Error getting generation: {e}")
+            logger.error(f"Error getting generation by draw: {e}")
             return None
     
     def get_history(self, limit: int = 5) -> List[Dict]:
-        """Get generation history"""
+        """Get generation history with results"""
         if not self.initialized:
             return []
         
@@ -149,14 +182,17 @@ class FirebaseService:
             for doc in docs:
                 data = doc.to_dict()
                 data['id'] = doc.id
-                # Convert timestamp to readable format
-                if 'timestamp' in data and data['timestamp']:
-                    data['date_readable'] = data['timestamp'].strftime('%Y-%m-%d %H:%M:%S') if hasattr(data['timestamp'], 'strftime') else str(data['timestamp'])
+                
+                # Fetch result if exists
+                result_doc = self.db.collection('results').document(doc.id).get()
+                if result_doc.exists:
+                    data['result'] = result_doc.to_dict()
+                
                 history.append(data)
             return history
             
         except Exception as e:
-            print(f"Error getting history: {e}")
+            logger.error(f"Error getting history: {e}")
             return []
     
     def update_roi_stats(self, stats: Dict) -> bool:
@@ -165,127 +201,81 @@ class FirebaseService:
             return False
         
         try:
-            # Add last updated timestamp
             stats['last_updated'] = firestore.SERVER_TIMESTAMP
             stats['last_updated_iso'] = datetime.now().isoformat()
             
             doc_ref = self.db.collection('stats').document('roi')
             doc_ref.set(stats, merge=True)
-            print("ROI stats updated")
+            logger.info("ROI stats updated")
             return True
             
         except Exception as e:
-            print(f"Error updating ROI stats: {e}")
+            logger.error(f"Error updating ROI stats: {e}")
             return False
     
     def get_roi_stats(self) -> Dict:
         """Get ROI statistics"""
         if not self.initialized:
-            return {
-                'total_spent': 0, 
-                'total_return': 0, 
-                'roi': 0, 
-                'games_played': 0,
-                'net_profit': 0
-            }
+            return self._default_roi_stats()
         
         try:
             doc_ref = self.db.collection('stats').document('roi')
             doc = doc_ref.get()
             if doc.exists:
                 stats = doc.to_dict()
-                # Remove server timestamp for JSON serialization
                 stats.pop('last_updated', None)
                 return stats
-            return {
-                'total_spent': 0, 
-                'total_return': 0, 
-                'roi': 0, 
-                'games_played': 0,
-                'net_profit': 0
-            }
+            return self._default_roi_stats()
             
         except Exception as e:
-            print(f"Error getting ROI stats: {e}")
-            return {
-                'total_spent': 0, 
-                'total_return': 0, 
-                'roi': 0, 
-                'games_played': 0,
-                'net_profit': 0
-            }
+            logger.error(f"Error getting ROI stats: {e}")
+            return self._default_roi_stats()
     
-    def get_all_generations(self, limit: int = 50) -> List[Dict]:
-        """Get all generations with results"""
-        if not self.initialized:
-            return []
-        
-        try:
-            docs = self.db.collection('generations')\
-                .order_by('timestamp', direction=firestore.Query.DESCENDING)\
-                .limit(limit)\
-                .stream()
-            
-            generations = []
-            for doc in docs:
-                gen_data = doc.to_dict()
-                gen_data['id'] = doc.id
-                
-                # Fetch result if exists
-                result_doc = self.db.collection('results').document(doc.id).get()
-                if result_doc.exists:
-                    gen_data['result'] = result_doc.to_dict()
-                
-                generations.append(gen_data)
-            return generations
-            
-        except Exception as e:
-            print(f"Error getting all generations: {e}")
-            return []
+    def _default_roi_stats(self) -> Dict:
+        return {
+            'total_spent': 0,
+            'total_return': 0,
+            'roi': 0,
+            'games_played': 0,
+            'net_profit': 0,
+            'wins': 0
+        }
     
-    def delete_generation(self, doc_id: str) -> bool:
-        """Delete a generation (for testing/cleanup)"""
+    def record_draw_result(self, draw_no: str, winning_numbers: List[int], additional: int) -> bool:
+        """Record official draw results"""
         if not self.initialized:
             return False
         
         try:
-            self.db.collection('generations').document(doc_id).delete()
-            # Also delete associated result if exists
-            self.db.collection('results').document(doc_id).delete()
-            print(f"Deleted generation: {doc_id}")
+            draw_data = {
+                'draw_no': draw_no,
+                'draw_date': datetime.now().isoformat(),
+                'winning_numbers': winning_numbers,
+                'additional_number': additional,
+                'recorded_at': firestore.SERVER_TIMESTAMP
+            }
+            
+            doc_ref = self.db.collection('draws').document(draw_no)
+            doc_ref.set(draw_data)
+            logger.info(f"Draw {draw_no} results recorded")
             return True
             
         except Exception as e:
-            print(f"Error deleting generation: {e}")
+            logger.error(f"Error recording draw result: {e}")
             return False
     
-    def get_statistics(self) -> Dict:
-        """Get overall statistics"""
+    def get_draw_result(self, draw_no: str) -> Optional[Dict]:
+        """Get official draw results"""
         if not self.initialized:
-            return {}
+            return None
         
         try:
-            # Get count of generations
-            generations_count = self.db.collection('generations').count().get()[0][0].value
-            
-            # Get count of results with prizes
-            results_with_prizes = self.db.collection('results')\
-                .where('prize_amount', '>', 0)\
-                .count().get()[0][0].value
-            
-            # Get ROI stats
-            roi_stats = self.get_roi_stats()
-            
-            return {
-                'total_generations': generations_count,
-                'wins_count': results_with_prizes,
-                'win_rate': (results_with_prizes / generations_count * 100) if generations_count > 0 else 0,
-                'total_spent': roi_stats.get('total_spent', 0),
-                'total_return': roi_stats.get('total_return', 0),
-                'roi': roi_stats.get('roi', 0),
-                'net_profit': roi_stats.get('net_profit', 0)
-            }
+            doc_ref = self.db.collection('draws').document(draw_no)
+            doc = doc_ref.get()
+            if doc.exists:
+                return doc.to_dict()
+            return None
             
         except Exception as e:
-            print(f"Error getting statistics: {e}")
-            return {}
+            logger.error(f"Error getting draw result: {e}")
+            return None
