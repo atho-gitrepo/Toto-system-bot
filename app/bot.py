@@ -18,13 +18,27 @@ class TotoBot:
         self.roi_service = ROIService(self.firebase)
     
     def generate_weekly_numbers(self, draw_info: dict = None) -> dict:
-        """Generate System 8 numbers for specific draw"""
+        """Generate System 8 numbers for specific draw (NO DUPLICATES)"""
         try:
             if not draw_info:
                 from services.draw_manager import DrawManager
                 draw_manager = DrawManager()
                 draw_info = draw_manager.get_current_draw()
             
+            draw_no = str(draw_info['draw_no'])
+            
+            # CRITICAL: Check if generation already exists for this draw
+            existing = self.firebase.get_generation_by_draw(draw_no)
+            if existing:
+                logger.warning(f"Generation already exists for draw {draw_no}. Not generating duplicate.")
+                return {
+                    'numbers': existing['numbers'], 
+                    'saved': True, 
+                    'already_exists': True,
+                    'id': existing['id']
+                }
+            
+            # Generate new numbers
             prev_numbers = self.generator.get_previous_numbers()
             numbers = self.generator.generate_system8_numbers(prev_numbers)
             
@@ -36,20 +50,19 @@ class TotoBot:
             
             # Save with draw information
             doc_id = self.firebase.save_generation(numbers, {
-                'draw_no': draw_info['draw_no'],
+                'draw_no': draw_no,
                 'draw_date': draw_info['draw_date'],
+                'draw_day': draw_info['draw_day'],
                 **metadata
             })
             
             if doc_id:
-                # Send to Telegram
-                self.telegram.send_numbers(numbers, draw_info)
-                logger.info(f"Numbers generated for draw {draw_info['draw_no']}")
+                logger.info(f"✅ New numbers generated for draw {draw_no}")
                 return {
                     'numbers': numbers, 
                     'saved': True, 
                     'id': doc_id, 
-                    'draw_no': draw_info['draw_no'],
+                    'draw_no': draw_no,
                     'draw_date': draw_info['draw_date']
                 }
             
@@ -60,13 +73,18 @@ class TotoBot:
             return {'error': str(e)}
     
     def check_results_for_draw(self, draw_no: str) -> dict:
-        """Check results for specific draw"""
+        """Check results for specific draw (ONCE per draw)"""
         try:
             # Get generation for this draw
             generation = self.firebase.get_generation_by_draw(draw_no)
             if not generation:
                 logger.warning(f"No generation found for draw {draw_no}")
                 return {'error': 'No generation found'}
+            
+            # Check if already checked
+            if generation.get('checked', False):
+                logger.info(f"Results already checked for draw {draw_no}")
+                return {'error': 'Already checked', 'checked': True}
             
             # Get draw results
             draw_result = self.firebase.get_draw_result(draw_no)
@@ -108,7 +126,7 @@ class TotoBot:
             return {'error': str(e), 'checked': False}
     
     def get_history(self, limit: int = 5) -> list:
-        """Get generation history"""
+        """Get generation history (one per draw)"""
         return self.firebase.get_history(limit)
     
     def get_roi_summary(self) -> str:
@@ -116,25 +134,6 @@ class TotoBot:
         stats = self.firebase.get_roi_stats()
         return f"ROI: {stats.get('roi', 0):.2f}% | Net: ${stats.get('net_profit', 0):,}"
     
-    def get_draw_status(self) -> dict:
-        """Get current draw status"""
-        from services.draw_manager import DrawManager
-        draw_manager = DrawManager()
-        return draw_manager.get_next_draw_info()
-    
-    def manual_trigger_generation(self) -> dict:
-        """Manual trigger for generation"""
-        from services.draw_manager import DrawManager
-        draw_manager = DrawManager()
-        draw_info = draw_manager.get_current_draw()
-        return self.generate_weekly_numbers(draw_info)
-    
-    def manual_trigger_result_check(self, draw_no: str = None) -> dict:
-        """Manual trigger for result checking"""
-        if draw_no:
-            return self.check_results_for_draw(draw_no)
-        else:
-            from services.draw_manager import DrawManager
-            draw_manager = DrawManager()
-            draw_info = draw_manager.get_current_draw()
-            return self.check_results_for_draw(str(draw_info['draw_no']))
+    def cleanup_draw_generations(self, draw_no: str) -> int:
+        """Clean up all generations for a specific draw"""
+        return self.firebase.delete_all_generations_for_draw(draw_no)
