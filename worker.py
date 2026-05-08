@@ -1,7 +1,7 @@
 import schedule
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from app.bot import TotoBot
 from services.draw_manager import DrawManager
 from services.result_service import ResultService
@@ -100,58 +100,59 @@ class AutomationWorker:
                     continue
                 
                 # Check if draw has occurred
-                draw_datetime = datetime.strptime(f"{draw_date} 18:30", "%Y-%m-%d %H:%M")
-                draw_datetime = self.sg_tz.localize(draw_datetime)
-                now = datetime.now(self.sg_tz)
-                
-                # Only check if draw has passed + 2 hours
-                check_time = draw_datetime + timedelta(hours=2)
-                
-                if now >= check_time:
-                    logger.info(f"Fetching results for Draw {draw_no}")
+                try:
+                    draw_datetime = datetime.strptime(f"{draw_date} 18:30", "%Y-%m-%d %H:%M")
+                    draw_datetime = self.sg_tz.localize(draw_datetime)
+                    now = datetime.now(self.sg_tz)
                     
-                    # Try to fetch results
-                    results = self.result_service.fetch_latest_results()
+                    # Only check if draw has passed + 2 hours
+                    check_time = draw_datetime + timedelta(hours=2)
                     
-                    if results and results.get('draw_no') == draw_no:
-                        logger.info(f"✅ Results fetched for Draw {draw_no}")
-                        logger.info(f"   Winning: {results['winning_numbers']} + {results['additional_number']}")
+                    if now >= check_time:
+                        logger.info(f"Fetching results for Draw {draw_no}")
                         
-                        # Check against user's numbers
-                        from services.match_engine import MatchEngine
-                        match_engine = MatchEngine()
-                        match_result = match_engine.check_matches(
-                            generation['numbers'],
-                            results['winning_numbers']
-                        )
+                        # Try to fetch results
+                        results = self.result_service.fetch_latest_results()
                         
-                        # Save results
-                        result_data = {
-                            'generation_id': generation['id'],
-                            'draw_no': draw_no,
-                            'numbers': generation['numbers'],
-                            'winning_numbers': results['winning_numbers'],
-                            'additional_number': results['additional_number'],
-                            'matches': match_result['matches'],
-                            'prize_group': match_result['prize_group'],
-                            'prize_amount': match_result['prize_amount'],
-                            'checked': True,
-                            'fetched_at': datetime.now().isoformat()
-                        }
-                        
-                        firebase.save_result(generation['id'], result_data)
-                        
-                        # Update ROI
-                        from services.roi_service import ROIService
-                        roi_service = ROIService(firebase)
-                        roi_service.update_roi(match_result['prize_amount'])
-                        
-                        # Send notification
-                        from services.telegram_service import TelegramService
-                        telegram = TelegramService()
-                        
-                        if match_result['prize_amount'] > 0:
-                            message = f"""🎉 <b>RESULT UPDATE - DRAW {draw_no}</b> 🎉
+                        if results and results.get('draw_no') == draw_no:
+                            logger.info(f"✅ Results fetched for Draw {draw_no}")
+                            logger.info(f"   Winning: {results['winning_numbers']} + {results['additional_number']}")
+                            
+                            # Check against user's numbers
+                            from services.match_engine import MatchEngine
+                            match_engine = MatchEngine()
+                            match_result = match_engine.check_matches(
+                                generation['numbers'],
+                                results['winning_numbers']
+                            )
+                            
+                            # Save results
+                            result_data = {
+                                'generation_id': generation['id'],
+                                'draw_no': draw_no,
+                                'numbers': generation['numbers'],
+                                'winning_numbers': results['winning_numbers'],
+                                'additional_number': results['additional_number'],
+                                'matches': match_result['matches'],
+                                'prize_group': match_result['prize_group'],
+                                'prize_amount': match_result['prize_amount'],
+                                'checked': True,
+                                'fetched_at': datetime.now().isoformat()
+                            }
+                            
+                            firebase.save_result(generation['id'], result_data)
+                            
+                            # Update ROI
+                            from services.roi_service import ROIService
+                            roi_service = ROIService(firebase)
+                            roi_service.update_roi(match_result['prize_amount'])
+                            
+                            # Send notification
+                            from services.telegram_service import TelegramService
+                            telegram = TelegramService()
+                            
+                            if match_result['prize_amount'] > 0:
+                                message = f"""🎉 <b>RESULT UPDATE - DRAW {draw_no}</b> 🎉
 
 📅 Date: {draw_date}
 
@@ -166,8 +167,8 @@ Winning Numbers: {results['winning_numbers']} + {results['additional_number']}
 ━━━━━━━━━━━━━━━━━━
 
 Check /roi for updated statistics!"""
-                        else:
-                            message = f"""📊 <b>RESULT UPDATE - DRAW {draw_no}</b>
+                            else:
+                                message = f"""📊 <b>RESULT UPDATE - DRAW {draw_no}</b>
 
 📅 Date: {draw_date}
 
@@ -180,16 +181,19 @@ Winning Numbers: {results['winning_numbers']} + {results['additional_number']}
 ━━━━━━━━━━━━━━━━━━
 
 Next draw: Numbers will be generated automatically!"""
-                        
-                        telegram.send_message(message, config.TELEGRAM_CHAT_ID)
-                        
+                            
+                            telegram.send_message(message, config.TELEGRAM_CHAT_ID)
+                            
+                        else:
+                            logger.warning(f"Results not yet available for Draw {draw_no}")
                     else:
-                        logger.warning(f"Results not yet available for Draw {draw_no}")
-                else:
-                    # Wait time
-                    wait_hours = (check_time - now).total_seconds() / 3600
-                    if wait_hours < 24:  # Only log if within 24 hours
-                        logger.info(f"Results for Draw {draw_no} available in {wait_hours:.1f} hours")
+                        # Wait time
+                        wait_hours = (check_time - now).total_seconds() / 3600
+                        if wait_hours < 24:  # Only log if within 24 hours
+                            logger.info(f"Results for Draw {draw_no} available in {wait_hours:.1f} hours")
+                except Exception as e:
+                    logger.error(f"Error processing draw {draw_no}: {e}")
+                    continue
             
         except Exception as e:
             logger.error(f"Result check error: {e}", exc_info=True)
