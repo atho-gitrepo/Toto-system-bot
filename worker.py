@@ -4,8 +4,8 @@ import logging
 from datetime import datetime
 from app.bot import TotoBot
 from services.draw_manager import DrawManager
+from services.result_service import ResultService
 import pytz
-import sys
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,6 +17,7 @@ class AutomationWorker:
     def __init__(self):
         self.bot = TotoBot()
         self.draw_manager = DrawManager()
+        self.result_service = ResultService()
         self.sg_tz = pytz.timezone('Asia/Singapore')
         logger.info("Automation Worker initialized")
     
@@ -25,28 +26,24 @@ class AutomationWorker:
         try:
             logger.info("Checking if generation needed for next draw...")
             
-            # Get current draw info
             draw_info = self.draw_manager.get_current_draw()
             draw_no = str(draw_info['draw_no'])
             
-            # CRITICAL: Check if numbers already exist for this draw
+            # Check if numbers already exist
             existing = self.bot.firebase.get_generation_by_draw(draw_no)
             
             if existing:
-                logger.info(f"✅ Numbers already exist for draw {draw_no} - skipping generation")
-                logger.info(f"   Existing numbers: {existing['numbers']}")
+                logger.info(f"✅ Numbers already exist for draw {draw_no}")
                 return
             
-            # Check if we should generate
+            # Generate if it's time
             if self.draw_manager.should_generate_numbers(draw_info):
                 logger.info(f"🎯 Generating numbers for draw {draw_no}")
                 
-                # Generate new numbers (this will save to Firebase)
                 result = self.bot.generate_weekly_numbers(draw_info)
                 
                 if result.get('saved'):
-                    logger.info(f"✅ Numbers generated successfully for draw {draw_no}")
-                    logger.info(f"   Numbers: {result['numbers']}")
+                    logger.info(f"✅ Numbers generated: {result['numbers']}")
                     
                     # Send Telegram notification
                     from services.telegram_service import TelegramService
@@ -64,25 +61,22 @@ class AutomationWorker:
 💰 Cost: $28
 💡 Strategy: 70% stability + 30% variation
 
-<i>Good luck! Bot will automatically check results after draw.</i>"""
+<i>Bot will automatically check results after draw!</i>"""
                     
                     telegram.send_message(message, config.TELEGRAM_CHAT_ID)
-                else:
-                    logger.error(f"❌ Failed to generate numbers: {result.get('error', 'Unknown error')}")
             else:
                 days = draw_info.get('days_until', '?')
-                logger.info(f"⏳ Not time to generate yet. Next draw in {days} days")
+                logger.info(f"⏳ Generation in {days} days")
                 
         except Exception as e:
-            logger.error(f"Error in generation job: {e}", exc_info=True)
+            logger.error(f"Generation error: {e}", exc_info=True)
     
-    def check_pending_results(self):
-        """Check results for pending draws (ONCE per draw)"""
+    def check_and_fetch_results(self):
+        """Check for draws that need results fetched"""
         try:
-            logger.info("Checking for pending results...")
+            logger.info("Checking for draws needing results...")
             
-            # Get all generations that haven't been checked
-            # Using a query for unchecked generations
+            # Get all pending generations
             from services.firebase_service import FirebaseService
             from config import config
             
@@ -91,77 +85,135 @@ class AutomationWorker:
                 project_id=config.FIREBASE_PROJECT_ID
             )
             
-            # Get all generations (we'll filter in code for simplicity)
-            all_gens = firebase.db.collection('generations').where('checked', '==', False).stream()
+            # Get all unchecked generations
+            docs = firebase.db.collection('generations')\
+                .where('checked', '==', False)\
+                .stream()
             
-            pending_count = 0
-            for doc in all_gens:
+            for doc in docs:
                 generation = doc.to_dict()
                 generation['id'] = doc.id
                 draw_no = generation.get('draw_no')
+                draw_date = generation.get('draw_date')
                 
-                if draw_no and not generation.get('checked', False):
-                    pending_count += 1
-                    logger.info(f"Checking results for draw {draw_no}")
+                if not draw_no or not draw_date:
+                    continue
+                
+                # Check if draw has occurred
+                draw_datetime = datetime.strptime(f"{draw_date} 18:30", "%Y-%m-%d %H:%M")
+                draw_datetime = self.sg_tz.localize(draw_datetime)
+                now = datetime.now(self.sg_tz)
+                
+                # Only check if draw has passed + 2 hours
+                check_time = draw_datetime + timedelta(hours=2)
+                
+                if now >= check_time:
+                    logger.info(f"Fetching results for Draw {draw_no}")
                     
-                    # Check if we should check results (draw has passed)
-                    draw_date = generation.get('draw_date')
-                    if draw_date:
-                        draw_datetime = datetime.strptime(draw_date, '%Y-%m-%d')
-                        draw_datetime = self.sg_tz.localize(draw_datetime.replace(hour=18, minute=30))
+                    # Try to fetch results
+                    results = self.result_service.fetch_latest_results()
+                    
+                    if results and results.get('draw_no') == draw_no:
+                        logger.info(f"✅ Results fetched for Draw {draw_no}")
+                        logger.info(f"   Winning: {results['winning_numbers']} + {results['additional_number']}")
                         
-                        # Only check if draw has passed + 2 hours
-                        if datetime.now(self.sg_tz) > draw_datetime:
-                            result = self.bot.check_results_for_draw(draw_no)
-                            if result and result.get('checked'):
-                                logger.info(f"✅ Results checked for draw {draw_no}")
-                                logger.info(f"   Matches: {result.get('matches', 0)}")
-                                if result.get('prize_amount', 0) > 0:
-                                    logger.info(f"   🎉 WIN! Prize: ${result['prize_amount']:,}")
-                            else:
-                                logger.warning(f"Results not yet available for draw {draw_no}")
-            
-            if pending_count == 0:
-                logger.info("No pending generations to check")
+                        # Check against user's numbers
+                        from services.match_engine import MatchEngine
+                        match_engine = MatchEngine()
+                        match_result = match_engine.check_matches(
+                            generation['numbers'],
+                            results['winning_numbers']
+                        )
+                        
+                        # Save results
+                        result_data = {
+                            'generation_id': generation['id'],
+                            'draw_no': draw_no,
+                            'numbers': generation['numbers'],
+                            'winning_numbers': results['winning_numbers'],
+                            'additional_number': results['additional_number'],
+                            'matches': match_result['matches'],
+                            'prize_group': match_result['prize_group'],
+                            'prize_amount': match_result['prize_amount'],
+                            'checked': True,
+                            'fetched_at': datetime.now().isoformat()
+                        }
+                        
+                        firebase.save_result(generation['id'], result_data)
+                        
+                        # Update ROI
+                        from services.roi_service import ROIService
+                        roi_service = ROIService(firebase)
+                        roi_service.update_roi(match_result['prize_amount'])
+                        
+                        # Send notification
+                        from services.telegram_service import TelegramService
+                        telegram = TelegramService()
+                        
+                        if match_result['prize_amount'] > 0:
+                            message = f"""🎉 <b>RESULT UPDATE - DRAW {draw_no}</b> 🎉
+
+📅 Date: {draw_date}
+
+Your Numbers: {generation['numbers']}
+Winning Numbers: {results['winning_numbers']} + {results['additional_number']}
+
+━━━━━━━━━━━━━━━━━━
+🎯 <b>YOU WON!</b>
+• Matches: {match_result['matches']} numbers
+• Prize Group: {match_result['prize_group']}
+• Prize Amount: ${match_result['prize_amount']:,}
+━━━━━━━━━━━━━━━━━━
+
+Check /roi for updated statistics!"""
+                        else:
+                            message = f"""📊 <b>RESULT UPDATE - DRAW {draw_no}</b>
+
+📅 Date: {draw_date}
+
+Your Numbers: {generation['numbers']}
+Winning Numbers: {results['winning_numbers']} + {results['additional_number']}
+
+━━━━━━━━━━━━━━━━━━
+🎯 Matches: {match_result['matches']} numbers
+💔 No win this time
+━━━━━━━━━━━━━━━━━━
+
+Next draw: Numbers will be generated automatically!"""
+                        
+                        telegram.send_message(message, config.TELEGRAM_CHAT_ID)
+                        
+                    else:
+                        logger.warning(f"Results not yet available for Draw {draw_no}")
+                else:
+                    # Wait time
+                    wait_hours = (check_time - now).total_seconds() / 3600
+                    if wait_hours < 24:  # Only log if within 24 hours
+                        logger.info(f"Results for Draw {draw_no} available in {wait_hours:.1f} hours")
             
         except Exception as e:
-            logger.error(f"Error in result check job: {e}", exc_info=True)
+            logger.error(f"Result check error: {e}", exc_info=True)
     
     def setup_schedules(self):
-        """Setup scheduled jobs - less frequent to prevent duplicates"""
+        """Setup scheduled jobs"""
         
-        # Run generation check once per day at 10 AM
+        # Run generation check daily at 10 AM
         schedule.every().day.at("10:00").do(self.generate_for_next_draw)
         
-        # Run result check twice per day after draws
-        schedule.every().day.at("20:30").do(self.check_pending_results)
-        schedule.every().day.at("21:00").do(self.check_pending_results)
+        # Run result checks every 2 hours after draws
+        schedule.every(2).hours.do(self.check_and_fetch_results)
         
         # Health check daily
         schedule.every().day.at("09:00").do(self.health_check)
         
-        logger.info("✅ Schedules configured (duplicate prevention enabled):")
-        logger.info("  - Generation check: Daily at 10:00 AM (once per day)")
-        logger.info("  - Result check: After draws at 8:30 PM, 9:00 PM")
+        logger.info("✅ Schedules configured:")
+        logger.info("  - Generation: Daily at 10:00 AM")
+        logger.info("  - Result checking: Every 2 hours")
         logger.info("  - Health check: Daily at 9:00 AM")
     
     def health_check(self):
         """Health check and status report"""
         try:
-            stats = self.bot.firebase.get_roi_stats()
-            draw_info = self.draw_manager.get_current_draw()
-            
-            logger.info(f"💚 Health Check - Games: {stats.get('games_played', 0)}, "
-                       f"ROI: {stats.get('roi', 0):.1f}%, "
-                       f"Next Draw: {draw_info.get('draw_no')} in {draw_info.get('days_until', '?')} days")
-        except Exception as e:
-            logger.error(f"Health check error: {e}")
-    
-    def cleanup_duplicate_generations(self):
-        """Clean up any existing duplicate generations for the same draw"""
-        try:
-            logger.info("Running duplicate cleanup...")
-            
             from services.firebase_service import FirebaseService
             from config import config
             
@@ -170,45 +222,21 @@ class AutomationWorker:
                 project_id=config.FIREBASE_PROJECT_ID
             )
             
-            # Get all generations
-            docs = firebase.db.collection('generations').stream()
+            stats = firebase.get_roi_stats()
+            draw_info = self.draw_manager.get_current_draw()
             
-            draw_generations = {}
+            # Count pending checks
+            pending = 0
+            docs = firebase.db.collection('generations').where('checked', '==', False).stream()
+            for _ in docs:
+                pending += 1
             
-            for doc in docs:
-                data = doc.to_dict()
-                draw_no = data.get('draw_no')
-                
-                if draw_no:
-                    if draw_no not in draw_generations:
-                        draw_generations[draw_no] = []
-                    draw_generations[draw_no].append({'id': doc.id, 'timestamp': data.get('timestamp')})
-            
-            # Keep only the most recent generation per draw
-            total_deleted = 0
-            for draw_no, gens in draw_generations.items():
-                if len(gens) > 1:
-                    # Sort by timestamp (most recent first)
-                    gens.sort(key=lambda x: x.get('timestamp', datetime.min), reverse=True)
-                    
-                    # Keep the first, delete the rest
-                    to_keep = gens[0]
-                    to_delete = gens[1:]
-                    
-                    logger.info(f"Draw {draw_no}: Found {len(gens)} generations. Keeping 1, deleting {len(to_delete)}")
-                    
-                    for gen in to_delete:
-                        firebase.db.collection('generations').document(gen['id']).delete()
-                        total_deleted += 1
-                        logger.info(f"  Deleted duplicate generation {gen['id']}")
-            
-            if total_deleted > 0:
-                logger.info(f"✅ Cleanup complete! Deleted {total_deleted} duplicate generations")
-            else:
-                logger.info("✅ No duplicates found")
-                
+            logger.info(f"💚 Health - Games: {stats.get('games_played', 0)}, "
+                       f"ROI: {stats.get('roi', 0):.1f}%, "
+                       f"Pending: {pending}, "
+                       f"Next: Draw {draw_info.get('draw_no')} in {draw_info.get('days_until', '?')} days")
         except Exception as e:
-            logger.error(f"Cleanup error: {e}")
+            logger.error(f"Health check error: {e}")
     
     def run(self):
         """Run the worker continuously"""
@@ -216,24 +244,23 @@ class AutomationWorker:
         logger.info("Starting Toto System 8 Automation Worker")
         logger.info("=" * 50)
         
-        # Run cleanup first to remove duplicates
-        self.cleanup_duplicate_generations()
+        # Check for pending results on startup
+        self.check_and_fetch_results()
         
-        # Generate for next draw if needed (and no existing)
+        # Generate for next draw if needed
         self.generate_for_next_draw()
         
         # Setup schedules
         self.setup_schedules()
         
-        logger.info("Worker is running. Waiting for scheduled jobs...")
-        logger.info("Press Ctrl+C to stop")
+        logger.info("Worker running. Waiting for scheduled jobs...")
         
         while True:
             try:
                 schedule.run_pending()
                 time.sleep(60)
             except KeyboardInterrupt:
-                logger.info("\nWorker stopped by user")
+                logger.info("\nWorker stopped")
                 break
             except Exception as e:
                 logger.error(f"Worker error: {e}", exc_info=True)
