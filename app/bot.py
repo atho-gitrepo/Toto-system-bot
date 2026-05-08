@@ -1,4 +1,3 @@
-cat > app/bot.py << 'EOF'
 from services import NumberGenerator, FirebaseService, TelegramService, ResultChecker, ROIService
 from config import config
 from datetime import datetime
