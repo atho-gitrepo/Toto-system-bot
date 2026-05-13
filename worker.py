@@ -1,10 +1,9 @@
 import schedule
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from app.bot import TotoBot
-from services.draw_manager import DrawManager
-from services.result_service import ResultService
+from services.draw_scheduler import DrawScheduler
 import pytz
 
 logging.basicConfig(
@@ -16,255 +15,181 @@ logger = logging.getLogger(__name__)
 class AutomationWorker:
     def __init__(self):
         self.bot = TotoBot()
-        self.draw_manager = DrawManager()
-        self.result_service = ResultService()
+        self.scheduler = DrawScheduler()
         self.sg_tz = pytz.timezone('Asia/Singapore')
-        logger.info("Automation Worker initialized")
+        logger.info("Hybrid Automation Worker initialized")
     
-    def generate_for_next_draw(self):
-        """Generate numbers ONCE for the next upcoming draw"""
+    def auto_generate_numbers(self):
+        """Generate numbers for upcoming draw"""
         try:
-            logger.info("Checking if generation needed for next draw...")
+            next_draw = self.scheduler.get_next_draw()
+            draw_no = str(next_draw['draw_no'])
             
-            draw_info = self.draw_manager.get_current_draw()
-            draw_no = str(draw_info['draw_no'])
-            
-            # Check if numbers already exist
             existing = self.bot.firebase.get_generation_by_draw(draw_no)
-            
             if existing:
-                logger.info(f"✅ Numbers already exist for draw {draw_no}")
+                logger.info(f"Numbers already exist for draw {draw_no}")
                 return
             
-            # Generate if it's time
-            if self.draw_manager.should_generate_numbers(draw_info):
-                logger.info(f"🎯 Generating numbers for draw {draw_no}")
-                
-                result = self.bot.generate_weekly_numbers(draw_info)
+            now = datetime.now(self.sg_tz)
+            draw_date = datetime.strptime(next_draw['draw_date'], '%Y-%m-%d')
+            days_until = (draw_date - now.date()).days
+            
+            if days_until <= 2 and days_until >= 0:
+                logger.info(f"Generating numbers for draw {draw_no}")
+                result = self.bot.generate_weekly_numbers(next_draw)
                 
                 if result.get('saved'):
                     logger.info(f"✅ Numbers generated: {result['numbers']}")
+                    message = f"""🎯 <b>NEW SYSTEM 8 NUMBERS</b>
+
+Draw #{draw_no}
+Date: {next_draw['draw_date']} ({next_draw['draw_day']})
+
+Numbers: <code>{' '.join(map(str, result['numbers']))}</code>
+
+<i>Results will be checked automatically after draw.
+If auto-fetch fails, use: /declare winning numbers</i>"""
+                    self.bot.telegram.send_message(message)
+                else:
+                    logger.error(f"Generation failed: {result.get('error')}")
                     
-                    # Send Telegram notification
-                    from services.telegram_service import TelegramService
-                    from config import config
-                    telegram = TelegramService()
-                    
-                    message = f"""🎯 <b>NEW SYSTEM 8 NUMBERS GENERATED</b>
-
-📅 Draw #{draw_no}
-📆 Date: {draw_info['draw_date']} ({draw_info['draw_day']})
-⏰ Time: 6:30 PM Singapore Time
-
-🔢 Your Numbers: <code>{' '.join(map(str, result['numbers']))}</code>
-
-💰 Cost: $28
-💡 Strategy: 70% stability + 30% variation
-
-<i>Bot will automatically check results after draw!</i>"""
-                    
-                    telegram.send_message(message, config.TELEGRAM_CHAT_ID)
+        except Exception as e:
+            logger.error(f"Auto-generation error: {e}", exc_info=True)
+    
+    def auto_check_results(self):
+        """Check results using hybrid method"""
+        try:
+            current_draw = self.scheduler.get_current_draw()
+            draw_no = str(current_draw['draw_no'])
+            
+            # Check if we should check results
+            if not self.scheduler.should_check_results(int(draw_no)):
+                logger.info(f"Not time to check results for draw {draw_no}")
+                return
+            
+            generation = self.bot.firebase.get_generation_by_draw(draw_no)
+            if not generation or generation.get('checked'):
+                return
+            
+            # Try to fetch results automatically
+            logger.info(f"Attempting to fetch results for draw {draw_no}...")
+            draw_result = self.bot.result_service.get_draw_result(draw_no)
+            
+            if draw_result and draw_result.get('winning_numbers'):
+                # Auto-fetch successful
+                self._process_results(draw_no, generation, draw_result)
             else:
-                days = draw_info.get('days_until', '?')
-                logger.info(f"⏳ Generation in {days} days")
+                # Auto-fetch failed - wait and notify
+                logger.warning(f"Could not auto-fetch results for draw {draw_no}")
+                message = f"""⚠️ <b>Results Not Auto-Fetched</b>
+
+Draw #{draw_no} has completed, but automatic result retrieval failed.
+
+Please manually declare results using:
+/declare 7,18,19,30,36,48 + 11
+
+(Replace with actual winning numbers)"""
+                self.bot.telegram.send_message(message)
                 
         except Exception as e:
-            logger.error(f"Generation error: {e}", exc_info=True)
+            logger.error(f"Auto-result check error: {e}", exc_info=True)
     
-    def check_and_fetch_results(self):
-        """Check for draws that need results fetched"""
-        try:
-            logger.info("Checking for draws needing results...")
-            
-            # Get all pending generations
-            from services.firebase_service import FirebaseService
-            from config import config
-            
-            firebase = FirebaseService(
-                credentials_json=config.FIREBASE_CREDENTIALS_JSON,
-                project_id=config.FIREBASE_PROJECT_ID
-            )
-            
-            # Get all unchecked generations
-            docs = firebase.db.collection('generations')\
-                .where('checked', '==', False)\
-                .stream()
-            
-            for doc in docs:
-                generation = doc.to_dict()
-                generation['id'] = doc.id
-                draw_no = generation.get('draw_no')
-                draw_date = generation.get('draw_date')
-                
-                if not draw_no or not draw_date:
-                    continue
-                
-                # Check if draw has occurred
-                try:
-                    draw_datetime = datetime.strptime(f"{draw_date} 18:30", "%Y-%m-%d %H:%M")
-                    draw_datetime = self.sg_tz.localize(draw_datetime)
-                    now = datetime.now(self.sg_tz)
-                    
-                    # Only check if draw has passed + 2 hours
-                    check_time = draw_datetime + timedelta(hours=2)
-                    
-                    if now >= check_time:
-                        logger.info(f"Fetching results for Draw {draw_no}")
-                        
-                        # Try to fetch results
-                        results = self.result_service.fetch_latest_results()
-                        
-                        if results and results.get('draw_no') == draw_no:
-                            logger.info(f"✅ Results fetched for Draw {draw_no}")
-                            logger.info(f"   Winning: {results['winning_numbers']} + {results['additional_number']}")
-                            
-                            # Check against user's numbers
-                            from services.match_engine import MatchEngine
-                            match_engine = MatchEngine()
-                            match_result = match_engine.check_matches(
-                                generation['numbers'],
-                                results['winning_numbers']
-                            )
-                            
-                            # Save results
-                            result_data = {
-                                'generation_id': generation['id'],
-                                'draw_no': draw_no,
-                                'numbers': generation['numbers'],
-                                'winning_numbers': results['winning_numbers'],
-                                'additional_number': results['additional_number'],
-                                'matches': match_result['matches'],
-                                'prize_group': match_result['prize_group'],
-                                'prize_amount': match_result['prize_amount'],
-                                'checked': True,
-                                'fetched_at': datetime.now().isoformat()
-                            }
-                            
-                            firebase.save_result(generation['id'], result_data)
-                            
-                            # Update ROI
-                            from services.roi_service import ROIService
-                            roi_service = ROIService(firebase)
-                            roi_service.update_roi(match_result['prize_amount'])
-                            
-                            # Send notification
-                            from services.telegram_service import TelegramService
-                            telegram = TelegramService()
-                            
-                            if match_result['prize_amount'] > 0:
-                                message = f"""🎉 <b>RESULT UPDATE - DRAW {draw_no}</b> 🎉
+    def _process_results(self, draw_no: str, generation: dict, draw_result: dict):
+        """Process and save results"""
+        from services.match_engine import MatchEngine
+        engine = MatchEngine()
+        
+        match_result = engine.check_matches(
+            generation['numbers'],
+            draw_result['winning_numbers']
+        )
+        
+        result_data = {
+            'generation_id': generation['id'],
+            'draw_no': draw_no,
+            'numbers': generation['numbers'],
+            'winning_numbers': draw_result['winning_numbers'],
+            'additional_number': draw_result.get('additional_number', 0),
+            'matches': match_result['matches'],
+            'prize_group': match_result['prize_group'],
+            'prize_amount': match_result['prize_amount']
+        }
+        
+        self.bot.firebase.save_result(generation['id'], result_data)
+        self.bot.roi_service.update_roi(match_result['prize_amount'])
+        
+        if match_result['prize_amount'] > 0:
+            message = f"""🎉 <b>CONGRATULATIONS! YOU WON!</b> 🎉
 
-📅 Date: {draw_date}
-
+Draw #{draw_no}
 Your Numbers: {generation['numbers']}
-Winning Numbers: {results['winning_numbers']} + {results['additional_number']}
+Winning: {draw_result['winning_numbers']} + {draw_result.get('additional_number', 0)}
 
-━━━━━━━━━━━━━━━━━━
-🎯 <b>YOU WON!</b>
-• Matches: {match_result['matches']} numbers
-• Prize Group: {match_result['prize_group']}
-• Prize Amount: ${match_result['prize_amount']:,}
-━━━━━━━━━━━━━━━━━━
+✅ Matches: {match_result['matches']}
+💰 Prize: ${match_result['prize_amount']:,}
 
 Check /roi for updated statistics!"""
-                            else:
-                                message = f"""📊 <b>RESULT UPDATE - DRAW {draw_no}</b>
+        else:
+            message = f"""📊 <b>Draw Result</b>
 
-📅 Date: {draw_date}
-
+Draw #{draw_no}
 Your Numbers: {generation['numbers']}
-Winning Numbers: {results['winning_numbers']} + {results['additional_number']}
+Winning: {draw_result['winning_numbers']} + {draw_result.get('additional_number', 0)}
 
-━━━━━━━━━━━━━━━━━━
-🎯 Matches: {match_result['matches']} numbers
-💔 No win this time
-━━━━━━━━━━━━━━━━━━
+Matches: {match_result['matches']}
+No win this time.
 
-Next draw: Numbers will be generated automatically!"""
-                            
-                            telegram.send_message(message, config.TELEGRAM_CHAT_ID)
-                            
-                        else:
-                            logger.warning(f"Results not yet available for Draw {draw_no}")
-                    else:
-                        # Wait time
-                        wait_hours = (check_time - now).total_seconds() / 3600
-                        if wait_hours < 24:  # Only log if within 24 hours
-                            logger.info(f"Results for Draw {draw_no} available in {wait_hours:.1f} hours")
-                except Exception as e:
-                    logger.error(f"Error processing draw {draw_no}: {e}")
-                    continue
-            
-        except Exception as e:
-            logger.error(f"Result check error: {e}", exc_info=True)
-    
-    def setup_schedules(self):
-        """Setup scheduled jobs"""
+Numbers for next draw will be generated automatically!"""
         
-        # Run generation check daily at 10 AM
-        schedule.every().day.at("10:00").do(self.generate_for_next_draw)
-        
-        # Run result checks every 2 hours after draws
-        schedule.every(2).hours.do(self.check_and_fetch_results)
-        
-        # Health check daily
-        schedule.every().day.at("09:00").do(self.health_check)
-        
-        logger.info("✅ Schedules configured:")
-        logger.info("  - Generation: Daily at 10:00 AM")
-        logger.info("  - Result checking: Every 2 hours")
-        logger.info("  - Health check: Daily at 9:00 AM")
+        self.bot.telegram.send_message(message)
+        logger.info(f"✅ Results processed for draw {draw_no}")
     
     def health_check(self):
-        """Health check and status report"""
+        """Health check"""
         try:
-            from services.firebase_service import FirebaseService
-            from config import config
-            
-            firebase = FirebaseService(
-                credentials_json=config.FIREBASE_CREDENTIALS_JSON,
-                project_id=config.FIREBASE_PROJECT_ID
-            )
-            
-            stats = firebase.get_roi_stats()
-            draw_info = self.draw_manager.get_current_draw()
-            
-            # Count pending checks
-            pending = 0
-            docs = firebase.db.collection('generations').where('checked', '==', False).stream()
-            for _ in docs:
-                pending += 1
-            
+            next_draw = self.scheduler.get_next_draw()
+            stats = self.bot.firebase.get_roi_stats()
             logger.info(f"💚 Health - Games: {stats.get('games_played', 0)}, "
                        f"ROI: {stats.get('roi', 0):.1f}%, "
-                       f"Pending: {pending}, "
-                       f"Next: Draw {draw_info.get('draw_no')} in {draw_info.get('days_until', '?')} days")
+                       f"Next: #{next_draw['draw_no']} on {next_draw['draw_date']}")
         except Exception as e:
             logger.error(f"Health check error: {e}")
     
+    def setup_schedules(self):
+        """Setup schedules"""
+        schedule.every().day.at("08:00").do(self.auto_generate_numbers)
+        schedule.every().day.at("12:00").do(self.auto_generate_numbers)
+        schedule.every().day.at("16:00").do(self.auto_generate_numbers)
+        
+        schedule.every(2).hours.do(self.auto_check_results)
+        schedule.every().day.at("20:30").do(self.auto_check_results)
+        schedule.every().day.at("21:00").do(self.auto_check_results)
+        
+        schedule.every().day.at("09:00").do(self.health_check)
+        
+        logger.info("✅ Hybrid schedules configured")
+        logger.info("  - Auto-fetch results from 3 sources")
+        logger.info("  - Manual /declare command available as backup")
+    
     def run(self):
-        """Run the worker continuously"""
-        logger.info("=" * 50)
-        logger.info("Starting Toto System 8 Automation Worker")
-        logger.info("=" * 50)
+        logger.info("=" * 60)
+        logger.info("HYBRID TOTO SYSTEM 8 WORKER")
+        logger.info("Auto-fetch + Manual fallback")
+        logger.info("=" * 60)
         
-        # Check for pending results on startup
-        self.check_and_fetch_results()
-        
-        # Generate for next draw if needed
-        self.generate_for_next_draw()
-        
-        # Setup schedules
+        self.auto_generate_numbers()
+        self.auto_check_results()
         self.setup_schedules()
         
-        logger.info("Worker running. Waiting for scheduled jobs...")
+        logger.info("Worker running. Bot will auto-fetch results.")
+        logger.info("If auto-fetch fails, use /declare command.")
         
         while True:
             try:
                 schedule.run_pending()
                 time.sleep(60)
             except KeyboardInterrupt:
-                logger.info("\nWorker stopped")
+                logger.info("Worker stopped")
                 break
             except Exception as e:
                 logger.error(f"Worker error: {e}", exc_info=True)
