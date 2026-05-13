@@ -1,4 +1,3 @@
-cat > worker.py << 'EOF'
 import schedule
 import time
 import logging
