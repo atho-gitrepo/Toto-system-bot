@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 toto_bot = TotoBot()
 
-# Admin chat ID (replace with your Telegram ID)
-ADMIN_CHAT_ID = "787922010"  # @oohta2025
+# Admin chat ID (your Telegram ID)
+ADMIN_CHAT_ID = "787922010"
 
 @app.route('/', methods=['GET'])
 def home():
@@ -23,13 +23,13 @@ def home():
     return jsonify({
         'status': 'running',
         'message': 'Toto System 8 Bot is active',
-        'version': '2.0.0',
+        'version': '3.0.0',
+        'hybrid_mode': 'enabled',
         'endpoints': {
             'webhook': '/webhook (POST)',
             'health': '/health (GET)',
             'home': '/ (GET)'
-        },
-        'next_draw': toto_bot.get_draw_status() if hasattr(toto_bot, 'get_draw_status') else 'Not available'
+        }
     }), 200
 
 @app.route('/health', methods=['GET'])
@@ -37,8 +37,6 @@ def health():
     """Health check endpoint"""
     try:
         stats = toto_bot.firebase.get_roi_stats()
-        pending = len(toto_bot.firebase.get_pending_generations()) if hasattr(toto_bot.firebase, 'get_pending_generations') else 0
-        
         return jsonify({
             'status': 'healthy',
             'timestamp': datetime.now().isoformat(),
@@ -46,7 +44,8 @@ def health():
             'stats': {
                 'games_played': stats.get('games_played', 0),
                 'total_spent': stats.get('total_spent', 0),
-                'pending_checks': pending
+                'total_return': stats.get('total_return', 0),
+                'roi': stats.get('roi', 0)
             }
         }), 200
     except Exception as e:
@@ -55,70 +54,85 @@ def health():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Handle Telegram webhook"""
+    """Handle Telegram webhook with hybrid commands"""
     try:
         data = request.get_json()
-        logger.info(f"Webhook received: {data}")
         
         if not data or 'message' not in data:
-            return jsonify({'status': 'ok', 'message': 'No message'}), 200
+            return jsonify({'status': 'ok'}), 200
         
         message = data['message']
         text = message.get('text', '')
         chat_id = str(message['chat']['id'])
         username = message.get('from', {}).get('username', 'Unknown')
-        first_name = message.get('from', {}).get('first_name', '')
         
         logger.info(f"Command from @{username} ({chat_id}): {text}")
         
-        # Process commands
+        # Command: /start
         if text == '/start':
-            response = f"""🎯 <b>Toto System 8 Bot Activated!</b>
+            response = """🎯 <b>Toto System 8 Bot Activated!</b>
 
-Welcome {first_name}! Your disciplined lottery system is ready.
+Welcome to your automated lottery system!
 
 <b>📋 Available Commands:</b>
+
+<u>Information Commands:</u>
 /start - Show this message
 /last - Last generated numbers
-/history - Last 5 generations
+/history - Last 5 generations with results
 /roi - ROI statistics
 /draw - Current draw information
 /next - Next draw details
 /status - Bot system status
-/help - Detailed help
+
+<u>Hybrid Result Commands:</u>
+/declare &lt;numbers&gt; + &lt;additional&gt; - Manually declare winning results
+/check - Force check results for current draw
+
+<u>Admin Commands:</u>
+/generate - Force generate numbers (admin only)
 
 <b>🤖 Automation:</b>
 • Numbers generated 2 days before each draw
-• Results checked automatically after draws
-• Draws every Monday & Thursday at 6:30 PM
+• Results auto-fetched from multiple sources
+• Manual /declare available as backup
 
-<i>Good luck and play responsibly! 🍀</i>"""
+<i>Draws every Monday & Thursday at 6:30 PM</i>
+
+Good luck! 🍀"""
             toto_bot.telegram.send_message(response, chat_id)
         
+        # Command: /last
         elif text == '/last':
             last = toto_bot.firebase.get_last_generation()
             if last:
                 numbers = ' '.join(map(str, last.get('numbers', [])))
                 date = last.get('date', 'Unknown')[:10]
                 draw_no = last.get('draw_no', 'Unknown')
-                status = last.get('status', 'pending')
-                status_emoji = '✅' if status == 'completed' else '⏳'
+                checked = last.get('checked', False)
+                prize = last.get('prize_amount', 0)
                 
-                response = f"""📅 <b>Last Generation</b> {status_emoji}
+                if checked and prize > 0:
+                    status = f"✅ RESULT: Won ${prize:,}!"
+                elif checked:
+                    status = "❌ No win"
+                else:
+                    status = "⏳ Pending (draw not yet checked)"
+                
+                response = f"""📅 <b>Last Generation</b>
 
-Draw No: {draw_no}
-Date: {date}
+Draw #{draw_no} ({date})
 Numbers: <code>{numbers}</code>
-Status: {status.upper()}
+Status: {status}
 
-/last - Refresh
-/history - View all"""
+/last - Refresh | /history - View all"""
             else:
                 response = "No numbers generated yet. Numbers will be generated before the next draw."
             toto_bot.telegram.send_message(response, chat_id)
         
+        # Command: /history
         elif text == '/history':
-            history = toto_bot.firebase.get_history(5)
+            history = toto_bot.get_history(5)
             if history:
                 response = "<b>📜 Last 5 Generations</b>\n\n"
                 for i, entry in enumerate(history, 1):
@@ -127,17 +141,21 @@ Status: {status.upper()}
                     draw_no = entry.get('draw_no', 'N/A')
                     matches = entry.get('matches', 0)
                     prize = entry.get('prize_amount', 0)
+                    checked = entry.get('checked', False)
                     
-                    if prize > 0:
+                    if checked and prize > 0:
                         response += f"{i}. Draw #{draw_no} ({date}): <code>{numbers}</code>\n   🎉 Won ${prize:,} ({matches} matches)\n\n"
+                    elif checked:
+                        response += f"{i}. Draw #{draw_no} ({date}): <code>{numbers}</code>\n   ❌ No win\n\n"
                     else:
-                        response += f"{i}. Draw #{draw_no} ({date}): <code>{numbers}</code>\n   No win\n\n"
+                        response += f"{i}. Draw #{draw_no} ({date}): <code>{numbers}</code>\n   ⏳ Pending\n\n"
                 
                 response += "<i>/roi - View detailed returns</i>"
             else:
-                response = "No history available. Numbers will be generated for the next draw."
+                response = "No history available."
             toto_bot.telegram.send_message(response, chat_id)
         
+        # Command: /roi
         elif text == '/roi':
             stats = toto_bot.firebase.get_roi_stats()
             wins = stats.get('wins', 0)
@@ -159,69 +177,73 @@ Status: {status.upper()}
 • ROI: {stats.get('roi', 0):.2f}%
 
 ━━━━━━━━━━━━━━━━━━
-<i>System 8 Strategy - Long-term Discipline</i>
+<i>System 8 Strategy - Long-term Tracking</i>
 
-/status - System status
-/history - View history"""
+/status - System status | /history - View history"""
             toto_bot.telegram.send_message(response, chat_id)
         
+        # Command: /draw
         elif text == '/draw':
-            from services.draw_manager import DrawManager
-            draw_manager = DrawManager()
-            draw_info = draw_manager.get_current_draw()
-            
-            response = f"""🎯 <b>Current Draw Information</b>
+            try:
+                from services.draw_scheduler import DrawScheduler
+                scheduler = DrawScheduler()
+                draw_info = scheduler.get_current_draw()
+                
+                response = f"""🎯 <b>Current Draw Information</b>
 
-📅 Draw No: <b>{draw_info['draw_no']}</b>
-📆 Date: {draw_info['draw_date']} ({draw_info['draw_day']})
-⏰ Time: {draw_info['draw_time']}
+Draw No: <b>{draw_info['draw_no']}</b>
+Date: {draw_info['draw_date']} ({draw_info['draw_day']})
+Time: {draw_info['draw_time']} Singapore Time
 
-⏳ Time remaining: {draw_info.get('days_until', '?')} days
+Status: {draw_info.get('status', 'upcoming').upper()}
 
 📌 <b>Schedule:</b>
 • Numbers Generation: 2 days before draw
 • Result Checking: After 8:30 PM on draw day
-• Notification: Automatic via Telegram
 
-<i>Draws every Monday & Thursday at 6:30 PM</i>
+<u>If auto-fetch fails, use:</u>
+/declare 7,18,19,30,36,48 + 11
 
-/next - Next draw details
-/status - System status"""
-            toto_bot.telegram.send_message(response, chat_id)
+/next - Next draw | /status - System status"""
+                toto_bot.telegram.send_message(response, chat_id)
+            except Exception as e:
+                toto_bot.telegram.send_message(f"Error getting draw info: {e}", chat_id)
         
+        # Command: /next
         elif text == '/next':
-            draw_info = toto_bot.get_draw_status()
-            from datetime import datetime, timedelta
-            
-            response = f"""🎯 <b>Next TOTO Draw</b>
+            try:
+                from services.draw_scheduler import DrawScheduler
+                scheduler = DrawScheduler()
+                draw_info = scheduler.get_next_draw()
+                
+                response = f"""🎯 <b>Next TOTO Draw</b>
 
-━━━━━━━━━━━━━━━━━━
-📅 Draw No: <b>{draw_info['draw_no']}</b>
-📆 Date: {draw_info['draw_date']} ({draw_info['draw_day']})
-⏰ Time: {draw_info['draw_time']}
+Draw No: <b>{draw_info['draw_no']}</b>
+Date: {draw_info['draw_date']} ({draw_info['draw_day']})
+Time: {draw_info['draw_time']} Singapore Time
+
 ⏳ Days until draw: {draw_info['days_until']}
 
-━━━━━━━━━━━━━━━━━━
-⚙️ <b>Automation Schedule</b>
-• Numbers Generated: {draw_info['generation_date']}
-• Results Checked: After draw on {draw_info['check_date']}
-• Notification: Sent immediately after checking
+⚙️ <b>Automation:</b>
+• Numbers will be generated automatically
+• Results will be checked after draw
+• You will receive Telegram notifications
 
-━━━━━━━━━━━━━━━━━━
-📊 <b>Draw History</b>
-• Last Draw: 4179 (May 4, 2026)
-• Winning: 7-18-19-30-36-48 + 11
+<i>Bot handles everything automatically!</i>
 
-<i>Bot will automatically handle everything!</i>
-
-/status - Check bot health"""
-            toto_bot.telegram.send_message(response, chat_id)
+/draw - Current draw | /status - System status"""
+                toto_bot.telegram.send_message(response, chat_id)
+            except Exception as e:
+                toto_bot.telegram.send_message(f"Error getting next draw: {e}", chat_id)
         
+        # Command: /status
         elif text == '/status':
             try:
                 stats = toto_bot.firebase.get_roi_stats()
+                from services.draw_scheduler import DrawScheduler
+                scheduler = DrawScheduler()
+                draw_info = scheduler.get_next_draw()
                 pending = len(toto_bot.firebase.get_pending_generations()) if hasattr(toto_bot.firebase, 'get_pending_generations') else 0
-                draw_info = toto_bot.get_draw_status()
                 
                 response = f"""🤖 <b>Bot System Status</b>
 
@@ -229,7 +251,7 @@ Status: {status.upper()}
 ✅ <b>System Health</b>
 • Firebase: {'Connected' if toto_bot.firebase.initialized else 'Disconnected'}
 • Bot Status: Active
-• Uptime: Continuous
+• Mode: Hybrid (Auto-fetch + Manual fallback)
 
 ━━━━━━━━━━━━━━━━━━
 📊 <b>Statistics</b>
@@ -248,25 +270,22 @@ Status: {status.upper()}
 ━━━━━━━━━━━━━━━━━━
 ⚙️ <b>Automation</b>
 • Pending Checks: {pending}
-• Auto-Generation: {'✓ Active' if draw_info['days_until'] <= 2 else '⏳ Waiting'}
-• Auto-Checking: {'✓ Active' if pending > 0 else '⏳ Idle'}
+• Auto-Fetch: Active (4 methods)
+• Manual Fallback: Available (/declare)
 
-<i>Bot is running normally and will handle all future draws automatically!</i>"""
+<i>Bot is running normally in hybrid mode!</i>"""
                 toto_bot.telegram.send_message(response, chat_id)
             except Exception as e:
-                logger.error(f"Status command error: {e}")
-                toto_bot.telegram.send_message("Error fetching status. Please try again later.", chat_id)
+                toto_bot.telegram.send_message(f"Error getting status: {e}", chat_id)
         
+        # Command: /help
         elif text == '/help':
-            response = """<b>📚 Complete Command List</b>
+            response = """<b>📚 Complete Command Guide</b>
 
 ━━━━━━━━━━━━━━━━━━
-<b>Basic Commands:</b>
+<b>📖 Information Commands:</b>
 /start - Activate bot and show welcome
 /help - Show this help message
-
-━━━━━━━━━━━━━━━━━━
-<b>Information Commands:</b>
 /last - Show your last generated numbers
 /history - Show last 5 generations with results
 /roi - Show ROI statistics
@@ -275,63 +294,244 @@ Status: {status.upper()}
 /status - Bot system status
 
 ━━━━━━━━━━━━━━━━━━
-<b>How It Works:</b>
-1️⃣ Bot generates System 8 numbers 2 days before each draw
-2️⃣ Numbers are saved to Firebase and sent to you
-3️⃣ After draw, bot automatically checks results
-4️⃣ You receive win/loss notification with prize amount
-5️⃣ ROI is tracked automatically
+<b>🎯 Hybrid Result Commands:</b>
+/declare &lt;numbers&gt; + &lt;additional&gt; - Manually declare winning results
+/check - Force check results for current draw
 
 ━━━━━━━━━━━━━━━━━━
-<b>Draw Schedule:</b>
-• Monday at 6:30 PM
-• Thursday at 6:30 PM
+<b>🔧 Admin Commands:</b>
+/generate - Force generate numbers for next draw
 
 ━━━━━━━━━━━━━━━━━━
-<i>No action needed - bot works automatically!</i>
+<b>📝 Usage Examples:</b>
+/declare 7,18,19,30,36,48 + 11
+/check
 
-/status - Check if bot is ready for next draw"""
+━━━━━━━━━━━━━━━━━━
+<b>🤖 How It Works:</b>
+1️⃣ Bot generates numbers 2 days before each draw
+2️⃣ After draw, bot auto-fetches results (4 methods)
+3️⃣ If auto-fetch fails, use /declare command
+4️⃣ Results are saved and ROI updated automatically
+
+<i>Draws every Monday & Thursday at 6:30 PM</i>
+
+/status - Check bot health"""
             toto_bot.telegram.send_message(response, chat_id)
         
+        # Command: /declare (Manual result entry - Hybrid fallback)
+        elif text.startswith('/declare'):
+            try:
+                # Parse the command: /declare 7,18,19,30,36,48 + 11
+                content = text.replace('/declare', '').strip()
+                
+                if not content:
+                    response = """❌ <b>Invalid format</b>
+
+Please use: /declare 7,18,19,30,36,48 + 11
+
+Examples:
+/declare 7,18,19,30,36,48 + 11
+/declare 1,2,3,4,5,6 + 7"""
+                    toto_bot.telegram.send_message(response, chat_id)
+                    return jsonify({'status': 'ok'}), 200
+                
+                # Parse numbers
+                if '+' in content:
+                    numbers_part, additional_part = content.split('+')
+                    winning_numbers = [int(x.strip()) for x in numbers_part.split(',')]
+                    additional = int(additional_part.strip())
+                else:
+                    # Assume just numbers
+                    parts = content.split(',')
+                    winning_numbers = [int(x.strip()) for x in parts[:6]]
+                    additional = int(parts[6]) if len(parts) > 6 else 0
+                
+                # Validate
+                if len(winning_numbers) != 6:
+                    response = "❌ Please provide exactly 6 winning numbers.\nFormat: /declare 7,18,19,30,36,48 + 11"
+                    toto_bot.telegram.send_message(response, chat_id)
+                    return jsonify({'status': 'ok'}), 200
+                
+                if not all(1 <= n <= 49 for n in winning_numbers):
+                    response = "❌ Numbers must be between 1 and 49"
+                    toto_bot.telegram.send_message(response, chat_id)
+                    return jsonify({'status': 'ok'}), 200
+                
+                # Get current draw
+                from services.draw_scheduler import DrawScheduler
+                scheduler = DrawScheduler()
+                current_draw = scheduler.get_current_draw()
+                draw_no = str(current_draw['draw_no'])
+                
+                # Save results manually
+                toto_bot.result_service.manual_update_results(draw_no, winning_numbers, additional)
+                toto_bot.firebase.record_draw_result(draw_no, winning_numbers, additional)
+                
+                # Check against user's numbers
+                generation = toto_bot.firebase.get_generation_by_draw(draw_no)
+                
+                if generation:
+                    from services.match_engine import MatchEngine
+                    engine = MatchEngine()
+                    match_result = engine.check_matches(generation['numbers'], winning_numbers)
+                    
+                    # Save result
+                    result_data = {
+                        'generation_id': generation['id'],
+                        'draw_no': draw_no,
+                        'numbers': generation['numbers'],
+                        'winning_numbers': winning_numbers,
+                        'additional_number': additional,
+                        'matches': match_result['matches'],
+                        'prize_group': match_result['prize_group'],
+                        'prize_amount': match_result['prize_amount'],
+                        'checked': True,
+                        'checked_at': datetime.now().isoformat(),
+                        'source': 'manual_declare'
+                    }
+                    toto_bot.firebase.save_result(generation['id'], result_data)
+                    toto_bot.roi_service.update_roi(match_result['prize_amount'])
+                    
+                    if match_result['prize_amount'] > 0:
+                        response = f"""🎉 <b>CONGRATULATIONS! YOU WON!</b> 🎉
+
+━━━━━━━━━━━━━━━━━━
+Draw #{draw_no}
+Your Numbers: {generation['numbers']}
+Winning Numbers: {winning_numbers} + {additional}
+━━━━━━━━━━━━━━━━━━
+
+✅ Matches: {match_result['matches']}
+🏆 Prize Group: {match_result['prize_group']}
+💰 Prize Amount: ${match_result['prize_amount']:,}
+
+<i>Results saved and ROI updated!</i>
+
+Check /roi for updated statistics!"""
+                    else:
+                        response = f"""📊 <b>Results Recorded</b>
+
+━━━━━━━━━━━━━━━━━━
+Draw #{draw_no}
+Your Numbers: {generation['numbers']}
+Winning Numbers: {winning_numbers} + {additional}
+━━━━━━━━━━━━━━━━━━
+
+Matches: {match_result['matches']}
+No win this time.
+
+<i>Results saved. Numbers for next draw will be generated automatically!</i>
+
+Check /roi for updated statistics."""
+                else:
+                    response = f"""✅ <b>Results Saved</b>
+
+Draw #{draw_no}
+Winning Numbers: {winning_numbers} + {additional}
+
+⚠️ No generation found for this draw.
+Numbers will be generated for the next draw."""
+                
+                toto_bot.telegram.send_message(response, chat_id)
+                
+            except ValueError as e:
+                response = f"❌ Invalid numbers. Please use format: /declare 7,18,19,30,36,48 + 11\nError: {e}"
+                toto_bot.telegram.send_message(response, chat_id)
+            except Exception as e:
+                logger.error(f"Declare command error: {e}")
+                response = f"❌ Error processing declaration: {e}"
+                toto_bot.telegram.send_message(response, chat_id)
+        
+        # Command: /check (Force check results)
+        elif text == '/check':
+            try:
+                response = "🔍 Checking for pending results..."
+                toto_bot.telegram.send_message(response, chat_id)
+                
+                from services.draw_scheduler import DrawScheduler
+                scheduler = DrawScheduler()
+                current_draw = scheduler.get_current_draw()
+                draw_no = str(current_draw['draw_no'])
+                
+                # Try to fetch results
+                result = toto_bot.result_service.get_draw_result(draw_no)
+                
+                if result and result.get('winning_numbers'):
+                    # Process results
+                    generation = toto_bot.firebase.get_generation_by_draw(draw_no)
+                    if generation:
+                        from services.match_engine import MatchEngine
+                        engine = MatchEngine()
+                        match_result = engine.check_matches(generation['numbers'], result['winning_numbers'])
+                        
+                        result_data = {
+                            'generation_id': generation['id'],
+                            'draw_no': draw_no,
+                            'numbers': generation['numbers'],
+                            'winning_numbers': result['winning_numbers'],
+                            'additional_number': result.get('additional_number', 0),
+                            'matches': match_result['matches'],
+                            'prize_group': match_result['prize_group'],
+                            'prize_amount': match_result['prize_amount']
+                        }
+                        toto_bot.firebase.save_result(generation['id'], result_data)
+                        toto_bot.roi_service.update_roi(match_result['prize_amount'])
+                        
+                        if match_result['prize_amount'] > 0:
+                            response = f"🎉 WINNER! Matches: {match_result['matches']}, Prize: ${match_result['prize_amount']:,}"
+                        else:
+                            response = f"Results checked. Matches: {match_result['matches']}. No win."
+                    else:
+                        response = "No generation found for this draw."
+                else:
+                    response = "⚠️ Results not yet available. Please try again later or use /declare command."
+                
+                toto_bot.telegram.send_message(response, chat_id)
+                
+            except Exception as e:
+                response = f"Error checking results: {e}"
+                toto_bot.telegram.send_message(response, chat_id)
+        
+        # Command: /generate (Admin only)
         elif text == '/generate' and chat_id == ADMIN_CHAT_ID:
-            # Admin only command
-            result = toto_bot.manual_trigger_generation()
-            if result.get('saved'):
-                numbers = result['numbers']
-                draw_no = result.get('draw_no', 'Unknown')
-                response = f"""🔧 <b>Manual Generation Triggered (Admin)</b>
+            try:
+                response = "🎯 Generating numbers for next draw..."
+                toto_bot.telegram.send_message(response, chat_id)
+                
+                from services.draw_scheduler import DrawScheduler
+                scheduler = DrawScheduler()
+                draw_info = scheduler.get_next_draw()
+                
+                result = toto_bot.generate_weekly_numbers(draw_info)
+                
+                if result.get('saved'):
+                    numbers = ' '.join(map(str, result['numbers']))
+                    response = f"""✅ <b>Numbers Generated!</b>
 
-✅ Numbers generated for Draw #{draw_no}
-🔢 Numbers: <code>{' '.join(map(str, numbers))}</code>
-📅 Target: {result.get('draw_date', 'Unknown')}
+Draw #{draw_info['draw_no']}
+Date: {draw_info['draw_date']}
+Numbers: <code>{numbers}</code>
 
-<i>Notification sent to all subscribers</i>"""
-            else:
-                response = f"❌ Generation failed: {result.get('error', 'Unknown error')}"
-            toto_bot.telegram.send_message(response, chat_id)
+Results will be checked automatically after the draw."""
+                else:
+                    response = f"❌ Generation failed: {result.get('error', 'Unknown error')}"
+                
+                toto_bot.telegram.send_message(response, chat_id)
+                
+            except Exception as e:
+                response = f"Error generating numbers: {e}"
+                toto_bot.telegram.send_message(response, chat_id)
         
-        elif text == '/check' and chat_id == ADMIN_CHAT_ID:
-            # Admin only command
-            result = toto_bot.manual_trigger_result_check()
-            if result and result.get('checked'):
-                response = f"""🔧 <b>Manual Result Check (Admin)</b>
-
-✅ Results checked for Draw #{result.get('draw_no')}
-🎯 Matches: {result.get('matches', 0)}
-💰 Prize: ${result.get('prize_amount', 0):,}
-
-<i>Notification sent to all subscribers</i>"""
-            else:
-                response = f"❌ Check failed: {result.get('error', 'Results not available')}"
-            toto_bot.telegram.send_message(response, chat_id)
-        
+        # Unknown command
         else:
-            # Unknown command
             response = f"""❓ Unknown command: {text}
 
 Send /help to see all available commands.
 
-<i>Tip: Bot works automatically! No action needed for draws.</i>"""
+<i>Tip: Bot works automatically! 
+If results don't auto-fetch, use:
+/declare 7,18,19,30,36,48 + 11</i>"""
             toto_bot.telegram.send_message(response, chat_id)
         
         return jsonify({'status': 'ok'}), 200
